@@ -1,0 +1,48 @@
+version: "3.6"
+services:
+  postgres:
+    image: postgres:12.2
+    restart: always
+    networks:
+      - internal
+    volumes:
+      - database:/var/lib/postgresql/data
+    env_file:
+      - database.env
+    ports:
+      - "5432:5432"
+  hasura:
+    container_name: dashboard_hasura
+    image: hasura/graphql-engine:latest
+    ports:
+      - "8080:8080"
+    depends_on:
+      - "postgres"
+    restart: always
+    networks:
+      - internal
+    environment:
+      HASURA_GRAPHQL_DATABASE_URL: postgres://postgres:postgres@postgres:5432/dever_dashboard
+      HASURA_GRAPHQL_ENABLE_CONSOLE: "true"
+      HASURA_GRAPHQL_ENABLED_LOG_TYPES: startup, http-log, webhook-log, websocket-log, query-log
+      HASURA_GRAPHQL_ADMIN_SECRET: Devegroup1212@@
+
+#   app:
+#     env_file:
+#       - .environments/prod.env
+#     networks:
+#       - internal
+#       - freelancer
+#       - jenkins
+#     build:
+#       context: .
+#       dockerfile: App.DockerFile
+#     restart: always
+#     depends_on:
+#       - "postgres"
+#       - "hasura"
+volumes:
+  database:
+    external: true
+networks:
+  internal:

@@ -1,0 +1,21 @@
+.body{
+    border: 20px solid #BEB291;
+
+}
+.content{
+    height: 570px;
+}
+.width-active{
+    width: 73px;
+}
+.width-role{
+    width: 86px ;
+}
+.edit {
+    color: yellow;
+    margin: 5px;
+}
+.delete {
+    color: black;
+    margin: 5px;
+}

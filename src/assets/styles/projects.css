@@ -1,0 +1,93 @@
+.ant-modal-body {
+  padding: 10px;
+}
+.ant-modal-body .modal_title {
+  font-weight: bold;
+  margin-right: 30px;
+  padding-bottom: 5px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid #f0f0f0;
+  display: block;
+  font-size: 20px;
+  text-transform: capitalize;
+  text-decoration: underline;
+}
+.ant-modal-body p > span {
+  font-weight: bold;
+  margin-right: 5px;
+}
+.ant-modal-body p button {
+  margin-bottom: 5px;
+  margin-right: 5px;
+  display: inline-block;
+}
+.ant-modal-body textarea {
+  width: 100%;
+}
+
+.sider-backdrop {
+  position: fixed;
+  width: 0;
+  /* min-width: calc(100vw - 200px); */
+  min-height: 100vh;
+  background-color: rgba(0, 0, 0, 0.5);
+  z-index: 8;
+  top: 0;
+  left: 200px;
+  overflow-y: hidden;
+}
+.overlay_status_pop .ant-popover-content .ant-popover-inner-content {
+  display: flex;
+  flex-direction: column;
+  width: fit-content;
+  padding: 5px 10px 0;
+}
+.overlay_status_pop .ant-popover-content .ant-popover-inner-content .ant-tag {
+  margin: 0 0 5px 0;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.overlay_status_pop
+  .ant-popover-content
+  .ant-popover-inner-content
+  .ant-tag:hover {
+  transform: scale(1.2);
+}
+.status_circle_wrapper {
+  padding: 5px;
+  margin-right: 20px;
+}
+.status_circle_wrapper .status_circle {
+  display: block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50px;
+  margin: 0 10px;
+  cursor: pointer;
+}
+.table_row_user,
+.table_row_scripts {
+  cursor: pointer;
+}
+/* antd table projects */
+.disabled-row {
+  background-color: #dcdcdc;
+}
+.disabled-row:hover {
+  background-color: #dcdcdc !important;
+}
+.disabled-row:hover td {
+  background-color: #dcdcdc !important;
+}
+.disabled-row .ant-table-cell:last-child {
+  pointer-events: none;
+  cursor: not-allowed;
+}
+.disabled-row .ant-table-cell:last-child button {
+  background-color: #40a9ff !important;
+  border-color: #40a9ff !important;
+}
+.disabled-row .ant-table-cell:last-child button.ant-btn-dangerous {
+  background-color: #ff7875 !important;
+  border-color: #ff7875 !important;
+}

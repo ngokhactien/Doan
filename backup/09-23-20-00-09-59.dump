@@ -1,0 +1,1847 @@
+--
+-- PostgreSQL database dump
+--
+
+-- Dumped from database version 12.2 (Debian 12.2-2.pgdg100+1)
+-- Dumped by pg_dump version 12.2 (Debian 12.2-2.pgdg100+1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: hdb_catalog; Type: SCHEMA; Schema: -; Owner: postgres
+--
+
+CREATE SCHEMA hdb_catalog;
+
+
+ALTER SCHEMA hdb_catalog OWNER TO postgres;
+
+--
+-- Name: hdb_views; Type: SCHEMA; Schema: -; Owner: postgres
+--
+
+CREATE SCHEMA hdb_views;
+
+
+ALTER SCHEMA hdb_views OWNER TO postgres;
+
+--
+-- Name: pgcrypto; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION pgcrypto; Type: COMMENT; Schema: -; Owner: 
+--
+
+COMMENT ON EXTENSION pgcrypto IS 'cryptographic functions';
+
+
+--
+-- Name: check_violation(text); Type: FUNCTION; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE FUNCTION hdb_catalog.check_violation(msg text) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+  BEGIN
+    RAISE check_violation USING message=msg;
+  END;
+$$;
+
+
+ALTER FUNCTION hdb_catalog.check_violation(msg text) OWNER TO postgres;
+
+--
+-- Name: hdb_schema_update_event_notifier(); Type: FUNCTION; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE FUNCTION hdb_catalog.hdb_schema_update_event_notifier() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+  DECLARE
+    instance_id uuid;
+    occurred_at timestamptz;
+    invalidations json;
+    curr_rec record;
+  BEGIN
+    instance_id = NEW.instance_id;
+    occurred_at = NEW.occurred_at;
+    invalidations = NEW.invalidations;
+    PERFORM pg_notify('hasura_schema_update', json_build_object(
+      'instance_id', instance_id,
+      'occurred_at', occurred_at,
+      'invalidations', invalidations
+      )::text);
+    RETURN curr_rec;
+  END;
+$$;
+
+
+ALTER FUNCTION hdb_catalog.hdb_schema_update_event_notifier() OWNER TO postgres;
+
+--
+-- Name: inject_table_defaults(text, text, text, text); Type: FUNCTION; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE FUNCTION hdb_catalog.inject_table_defaults(view_schema text, view_name text, tab_schema text, tab_name text) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+        r RECORD;
+    BEGIN
+      FOR r IN SELECT column_name, column_default FROM information_schema.columns WHERE table_schema = tab_schema AND table_name = tab_name AND column_default IS NOT NULL LOOP
+          EXECUTE format('ALTER VIEW %I.%I ALTER COLUMN %I SET DEFAULT %s;', view_schema, view_name, r.column_name, r.column_default);
+      END LOOP;
+    END;
+$$;
+
+
+ALTER FUNCTION hdb_catalog.inject_table_defaults(view_schema text, view_name text, tab_schema text, tab_name text) OWNER TO postgres;
+
+--
+-- Name: insert_event_log(text, text, text, text, json); Type: FUNCTION; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE FUNCTION hdb_catalog.insert_event_log(schema_name text, table_name text, trigger_name text, op text, row_data json) RETURNS text
+    LANGUAGE plpgsql
+    AS $$
+  DECLARE
+    id text;
+    payload json;
+    session_variables json;
+    server_version_num int;
+    trace_context json;
+  BEGIN
+    id := gen_random_uuid();
+    server_version_num := current_setting('server_version_num');
+    IF server_version_num >= 90600 THEN
+      session_variables := current_setting('hasura.user', 't');
+      trace_context := current_setting('hasura.tracecontext', 't');
+    ELSE
+      BEGIN
+        session_variables := current_setting('hasura.user');
+      EXCEPTION WHEN OTHERS THEN
+                  session_variables := NULL;
+      END;
+      BEGIN
+        trace_context := current_setting('hasura.tracecontext');
+      EXCEPTION WHEN OTHERS THEN
+        trace_context := NULL;
+      END;
+    END IF;
+    payload := json_build_object(
+      'op', op,
+      'data', row_data,
+      'session_variables', session_variables,
+      'trace_context', trace_context
+    );
+    INSERT INTO hdb_catalog.event_log
+                (id, schema_name, table_name, trigger_name, payload)
+    VALUES
+    (id, schema_name, table_name, trigger_name, payload);
+    RETURN id;
+  END;
+$$;
+
+
+ALTER FUNCTION hdb_catalog.insert_event_log(schema_name text, table_name text, trigger_name text, op text, row_data json) OWNER TO postgres;
+
+--
+-- Name: set_current_timestamp_updated_at(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.set_current_timestamp_updated_at() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  _new record;
+BEGIN
+  _new := NEW;
+  _new."updated_at" = NOW();
+  RETURN _new;
+END;
+$$;
+
+
+ALTER FUNCTION public.set_current_timestamp_updated_at() OWNER TO postgres;
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: event_invocation_logs; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.event_invocation_logs (
+    id text DEFAULT public.gen_random_uuid() NOT NULL,
+    event_id text,
+    status integer,
+    request json,
+    response json,
+    created_at timestamp without time zone DEFAULT now()
+);
+
+
+ALTER TABLE hdb_catalog.event_invocation_logs OWNER TO postgres;
+
+--
+-- Name: event_log; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.event_log (
+    id text DEFAULT public.gen_random_uuid() NOT NULL,
+    schema_name text NOT NULL,
+    table_name text NOT NULL,
+    trigger_name text NOT NULL,
+    payload jsonb NOT NULL,
+    delivered boolean DEFAULT false NOT NULL,
+    error boolean DEFAULT false NOT NULL,
+    tries integer DEFAULT 0 NOT NULL,
+    created_at timestamp without time zone DEFAULT now(),
+    locked boolean DEFAULT false NOT NULL,
+    next_retry_at timestamp without time zone,
+    archived boolean DEFAULT false NOT NULL
+);
+
+
+ALTER TABLE hdb_catalog.event_log OWNER TO postgres;
+
+--
+-- Name: event_triggers; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.event_triggers (
+    name text NOT NULL,
+    type text NOT NULL,
+    schema_name text NOT NULL,
+    table_name text NOT NULL,
+    configuration json,
+    comment text
+);
+
+
+ALTER TABLE hdb_catalog.event_triggers OWNER TO postgres;
+
+--
+-- Name: hdb_action; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_action (
+    action_name text NOT NULL,
+    action_defn jsonb NOT NULL,
+    comment text,
+    is_system_defined boolean DEFAULT false
+);
+
+
+ALTER TABLE hdb_catalog.hdb_action OWNER TO postgres;
+
+--
+-- Name: hdb_action_log; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_action_log (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    action_name text,
+    input_payload jsonb NOT NULL,
+    request_headers jsonb NOT NULL,
+    session_variables jsonb NOT NULL,
+    response_payload jsonb,
+    errors jsonb,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    response_received_at timestamp with time zone,
+    status text NOT NULL,
+    CONSTRAINT hdb_action_log_status_check CHECK ((status = ANY (ARRAY['created'::text, 'processing'::text, 'completed'::text, 'error'::text])))
+);
+
+
+ALTER TABLE hdb_catalog.hdb_action_log OWNER TO postgres;
+
+--
+-- Name: hdb_action_permission; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_action_permission (
+    action_name text NOT NULL,
+    role_name text NOT NULL,
+    definition jsonb DEFAULT '{}'::jsonb NOT NULL,
+    comment text
+);
+
+
+ALTER TABLE hdb_catalog.hdb_action_permission OWNER TO postgres;
+
+--
+-- Name: hdb_allowlist; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_allowlist (
+    collection_name text
+);
+
+
+ALTER TABLE hdb_catalog.hdb_allowlist OWNER TO postgres;
+
+--
+-- Name: hdb_check_constraint; Type: VIEW; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE VIEW hdb_catalog.hdb_check_constraint AS
+ SELECT (n.nspname)::text AS table_schema,
+    (ct.relname)::text AS table_name,
+    (r.conname)::text AS constraint_name,
+    pg_get_constraintdef(r.oid, true) AS "check"
+   FROM ((pg_constraint r
+     JOIN pg_class ct ON ((r.conrelid = ct.oid)))
+     JOIN pg_namespace n ON ((ct.relnamespace = n.oid)))
+  WHERE (r.contype = 'c'::"char");
+
+
+ALTER TABLE hdb_catalog.hdb_check_constraint OWNER TO postgres;
+
+--
+-- Name: hdb_computed_field; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_computed_field (
+    table_schema text NOT NULL,
+    table_name text NOT NULL,
+    computed_field_name text NOT NULL,
+    definition jsonb NOT NULL,
+    comment text
+);
+
+
+ALTER TABLE hdb_catalog.hdb_computed_field OWNER TO postgres;
+
+--
+-- Name: hdb_computed_field_function; Type: VIEW; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE VIEW hdb_catalog.hdb_computed_field_function AS
+ SELECT hdb_computed_field.table_schema,
+    hdb_computed_field.table_name,
+    hdb_computed_field.computed_field_name,
+        CASE
+            WHEN (((hdb_computed_field.definition -> 'function'::text) ->> 'name'::text) IS NULL) THEN (hdb_computed_field.definition ->> 'function'::text)
+            ELSE ((hdb_computed_field.definition -> 'function'::text) ->> 'name'::text)
+        END AS function_name,
+        CASE
+            WHEN (((hdb_computed_field.definition -> 'function'::text) ->> 'schema'::text) IS NULL) THEN 'public'::text
+            ELSE ((hdb_computed_field.definition -> 'function'::text) ->> 'schema'::text)
+        END AS function_schema
+   FROM hdb_catalog.hdb_computed_field;
+
+
+ALTER TABLE hdb_catalog.hdb_computed_field_function OWNER TO postgres;
+
+--
+-- Name: hdb_cron_event_invocation_logs; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_cron_event_invocation_logs (
+    id text DEFAULT public.gen_random_uuid() NOT NULL,
+    event_id text,
+    status integer,
+    request json,
+    response json,
+    created_at timestamp without time zone DEFAULT now()
+);
+
+
+ALTER TABLE hdb_catalog.hdb_cron_event_invocation_logs OWNER TO postgres;
+
+--
+-- Name: hdb_cron_events; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_cron_events (
+    id text DEFAULT public.gen_random_uuid() NOT NULL,
+    trigger_name text NOT NULL,
+    scheduled_time timestamp with time zone NOT NULL,
+    status text DEFAULT 'scheduled'::text NOT NULL,
+    tries integer DEFAULT 0 NOT NULL,
+    created_at timestamp without time zone DEFAULT now(),
+    next_retry_at timestamp with time zone,
+    CONSTRAINT valid_status CHECK ((status = ANY (ARRAY['scheduled'::text, 'locked'::text, 'delivered'::text, 'error'::text, 'dead'::text])))
+);
+
+
+ALTER TABLE hdb_catalog.hdb_cron_events OWNER TO postgres;
+
+--
+-- Name: hdb_cron_triggers; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_cron_triggers (
+    name text NOT NULL,
+    webhook_conf json NOT NULL,
+    cron_schedule text NOT NULL,
+    payload json,
+    retry_conf json,
+    header_conf json,
+    include_in_metadata boolean DEFAULT false NOT NULL,
+    comment text
+);
+
+
+ALTER TABLE hdb_catalog.hdb_cron_triggers OWNER TO postgres;
+
+--
+-- Name: hdb_cron_events_stats; Type: VIEW; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE VIEW hdb_catalog.hdb_cron_events_stats AS
+ SELECT ct.name,
+    COALESCE(ce.upcoming_events_count, (0)::bigint) AS upcoming_events_count,
+    COALESCE(ce.max_scheduled_time, now()) AS max_scheduled_time
+   FROM (hdb_catalog.hdb_cron_triggers ct
+     LEFT JOIN ( SELECT hdb_cron_events.trigger_name,
+            count(*) AS upcoming_events_count,
+            max(hdb_cron_events.scheduled_time) AS max_scheduled_time
+           FROM hdb_catalog.hdb_cron_events
+          WHERE ((hdb_cron_events.tries = 0) AND (hdb_cron_events.status = 'scheduled'::text))
+          GROUP BY hdb_cron_events.trigger_name) ce ON ((ct.name = ce.trigger_name)));
+
+
+ALTER TABLE hdb_catalog.hdb_cron_events_stats OWNER TO postgres;
+
+--
+-- Name: hdb_custom_types; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_custom_types (
+    custom_types jsonb NOT NULL
+);
+
+
+ALTER TABLE hdb_catalog.hdb_custom_types OWNER TO postgres;
+
+--
+-- Name: hdb_foreign_key_constraint; Type: VIEW; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE VIEW hdb_catalog.hdb_foreign_key_constraint AS
+ SELECT (q.table_schema)::text AS table_schema,
+    (q.table_name)::text AS table_name,
+    (q.constraint_name)::text AS constraint_name,
+    (min(q.constraint_oid))::integer AS constraint_oid,
+    min((q.ref_table_table_schema)::text) AS ref_table_table_schema,
+    min((q.ref_table)::text) AS ref_table,
+    json_object_agg(ac.attname, afc.attname) AS column_mapping,
+    min((q.confupdtype)::text) AS on_update,
+    min((q.confdeltype)::text) AS on_delete,
+    json_agg(ac.attname) AS columns,
+    json_agg(afc.attname) AS ref_columns
+   FROM ((( SELECT ctn.nspname AS table_schema,
+            ct.relname AS table_name,
+            r.conrelid AS table_id,
+            r.conname AS constraint_name,
+            r.oid AS constraint_oid,
+            cftn.nspname AS ref_table_table_schema,
+            cft.relname AS ref_table,
+            r.confrelid AS ref_table_id,
+            r.confupdtype,
+            r.confdeltype,
+            unnest(r.conkey) AS column_id,
+            unnest(r.confkey) AS ref_column_id
+           FROM ((((pg_constraint r
+             JOIN pg_class ct ON ((r.conrelid = ct.oid)))
+             JOIN pg_namespace ctn ON ((ct.relnamespace = ctn.oid)))
+             JOIN pg_class cft ON ((r.confrelid = cft.oid)))
+             JOIN pg_namespace cftn ON ((cft.relnamespace = cftn.oid)))
+          WHERE (r.contype = 'f'::"char")) q
+     JOIN pg_attribute ac ON (((q.column_id = ac.attnum) AND (q.table_id = ac.attrelid))))
+     JOIN pg_attribute afc ON (((q.ref_column_id = afc.attnum) AND (q.ref_table_id = afc.attrelid))))
+  GROUP BY q.table_schema, q.table_name, q.constraint_name;
+
+
+ALTER TABLE hdb_catalog.hdb_foreign_key_constraint OWNER TO postgres;
+
+--
+-- Name: hdb_function; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_function (
+    function_schema text NOT NULL,
+    function_name text NOT NULL,
+    configuration jsonb DEFAULT '{}'::jsonb NOT NULL,
+    is_system_defined boolean DEFAULT false
+);
+
+
+ALTER TABLE hdb_catalog.hdb_function OWNER TO postgres;
+
+--
+-- Name: hdb_function_agg; Type: VIEW; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE VIEW hdb_catalog.hdb_function_agg AS
+ SELECT (p.proname)::text AS function_name,
+    (pn.nspname)::text AS function_schema,
+    pd.description,
+        CASE
+            WHEN (p.provariadic = (0)::oid) THEN false
+            ELSE true
+        END AS has_variadic,
+        CASE
+            WHEN ((p.provolatile)::text = ('i'::character(1))::text) THEN 'IMMUTABLE'::text
+            WHEN ((p.provolatile)::text = ('s'::character(1))::text) THEN 'STABLE'::text
+            WHEN ((p.provolatile)::text = ('v'::character(1))::text) THEN 'VOLATILE'::text
+            ELSE NULL::text
+        END AS function_type,
+    pg_get_functiondef(p.oid) AS function_definition,
+    (rtn.nspname)::text AS return_type_schema,
+    (rt.typname)::text AS return_type_name,
+    (rt.typtype)::text AS return_type_type,
+    p.proretset AS returns_set,
+    ( SELECT COALESCE(json_agg(json_build_object('schema', q.schema, 'name', q.name, 'type', q.type)), '[]'::json) AS "coalesce"
+           FROM ( SELECT pt.typname AS name,
+                    pns.nspname AS schema,
+                    pt.typtype AS type,
+                    pat.ordinality
+                   FROM ((unnest(COALESCE(p.proallargtypes, (p.proargtypes)::oid[])) WITH ORDINALITY pat(oid, ordinality)
+                     LEFT JOIN pg_type pt ON ((pt.oid = pat.oid)))
+                     LEFT JOIN pg_namespace pns ON ((pt.typnamespace = pns.oid)))
+                  ORDER BY pat.ordinality) q) AS input_arg_types,
+    to_json(COALESCE(p.proargnames, ARRAY[]::text[])) AS input_arg_names,
+    p.pronargdefaults AS default_args,
+    (p.oid)::integer AS function_oid
+   FROM ((((pg_proc p
+     JOIN pg_namespace pn ON ((pn.oid = p.pronamespace)))
+     JOIN pg_type rt ON ((rt.oid = p.prorettype)))
+     JOIN pg_namespace rtn ON ((rtn.oid = rt.typnamespace)))
+     LEFT JOIN pg_description pd ON ((p.oid = pd.objoid)))
+  WHERE (((pn.nspname)::text !~~ 'pg_%'::text) AND ((pn.nspname)::text <> ALL (ARRAY['information_schema'::text, 'hdb_catalog'::text, 'hdb_views'::text])) AND (NOT (EXISTS ( SELECT 1
+           FROM pg_aggregate
+          WHERE ((pg_aggregate.aggfnoid)::oid = p.oid)))));
+
+
+ALTER TABLE hdb_catalog.hdb_function_agg OWNER TO postgres;
+
+--
+-- Name: hdb_function_info_agg; Type: VIEW; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE VIEW hdb_catalog.hdb_function_info_agg AS
+ SELECT hdb_function_agg.function_name,
+    hdb_function_agg.function_schema,
+    row_to_json(( SELECT e.*::record AS e
+           FROM ( SELECT hdb_function_agg.description,
+                    hdb_function_agg.has_variadic,
+                    hdb_function_agg.function_type,
+                    hdb_function_agg.return_type_schema,
+                    hdb_function_agg.return_type_name,
+                    hdb_function_agg.return_type_type,
+                    hdb_function_agg.returns_set,
+                    hdb_function_agg.input_arg_types,
+                    hdb_function_agg.input_arg_names,
+                    hdb_function_agg.default_args,
+                    (EXISTS ( SELECT 1
+                           FROM information_schema.tables
+                          WHERE (((tables.table_schema)::name = hdb_function_agg.return_type_schema) AND ((tables.table_name)::name = hdb_function_agg.return_type_name)))) AS returns_table) e)) AS function_info
+   FROM hdb_catalog.hdb_function_agg;
+
+
+ALTER TABLE hdb_catalog.hdb_function_info_agg OWNER TO postgres;
+
+--
+-- Name: hdb_permission; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_permission (
+    table_schema name NOT NULL,
+    table_name name NOT NULL,
+    role_name text NOT NULL,
+    perm_type text NOT NULL,
+    perm_def jsonb NOT NULL,
+    comment text,
+    is_system_defined boolean DEFAULT false,
+    CONSTRAINT hdb_permission_perm_type_check CHECK ((perm_type = ANY (ARRAY['insert'::text, 'select'::text, 'update'::text, 'delete'::text])))
+);
+
+
+ALTER TABLE hdb_catalog.hdb_permission OWNER TO postgres;
+
+--
+-- Name: hdb_permission_agg; Type: VIEW; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE VIEW hdb_catalog.hdb_permission_agg AS
+ SELECT hdb_permission.table_schema,
+    hdb_permission.table_name,
+    hdb_permission.role_name,
+    json_object_agg(hdb_permission.perm_type, hdb_permission.perm_def) AS permissions
+   FROM hdb_catalog.hdb_permission
+  GROUP BY hdb_permission.table_schema, hdb_permission.table_name, hdb_permission.role_name;
+
+
+ALTER TABLE hdb_catalog.hdb_permission_agg OWNER TO postgres;
+
+--
+-- Name: hdb_primary_key; Type: VIEW; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE VIEW hdb_catalog.hdb_primary_key AS
+ SELECT tc.table_schema,
+    tc.table_name,
+    tc.constraint_name,
+    json_agg(constraint_column_usage.column_name) AS columns
+   FROM (information_schema.table_constraints tc
+     JOIN ( SELECT x.tblschema AS table_schema,
+            x.tblname AS table_name,
+            x.colname AS column_name,
+            x.cstrname AS constraint_name
+           FROM ( SELECT DISTINCT nr.nspname,
+                    r.relname,
+                    a.attname,
+                    c.conname
+                   FROM pg_namespace nr,
+                    pg_class r,
+                    pg_attribute a,
+                    pg_depend d,
+                    pg_namespace nc,
+                    pg_constraint c
+                  WHERE ((nr.oid = r.relnamespace) AND (r.oid = a.attrelid) AND (d.refclassid = ('pg_class'::regclass)::oid) AND (d.refobjid = r.oid) AND (d.refobjsubid = a.attnum) AND (d.classid = ('pg_constraint'::regclass)::oid) AND (d.objid = c.oid) AND (c.connamespace = nc.oid) AND (c.contype = 'c'::"char") AND (r.relkind = ANY (ARRAY['r'::"char", 'p'::"char"])) AND (NOT a.attisdropped))
+                UNION ALL
+                 SELECT nr.nspname,
+                    r.relname,
+                    a.attname,
+                    c.conname
+                   FROM pg_namespace nr,
+                    pg_class r,
+                    pg_attribute a,
+                    pg_namespace nc,
+                    pg_constraint c
+                  WHERE ((nr.oid = r.relnamespace) AND (r.oid = a.attrelid) AND (nc.oid = c.connamespace) AND (r.oid =
+                        CASE c.contype
+                            WHEN 'f'::"char" THEN c.confrelid
+                            ELSE c.conrelid
+                        END) AND (a.attnum = ANY (
+                        CASE c.contype
+                            WHEN 'f'::"char" THEN c.confkey
+                            ELSE c.conkey
+                        END)) AND (NOT a.attisdropped) AND (c.contype = ANY (ARRAY['p'::"char", 'u'::"char", 'f'::"char"])) AND (r.relkind = ANY (ARRAY['r'::"char", 'p'::"char"])))) x(tblschema, tblname, colname, cstrname)) constraint_column_usage ON ((((tc.constraint_name)::text = (constraint_column_usage.constraint_name)::text) AND ((tc.table_schema)::text = (constraint_column_usage.table_schema)::text) AND ((tc.table_name)::text = (constraint_column_usage.table_name)::text))))
+  WHERE ((tc.constraint_type)::text = 'PRIMARY KEY'::text)
+  GROUP BY tc.table_schema, tc.table_name, tc.constraint_name;
+
+
+ALTER TABLE hdb_catalog.hdb_primary_key OWNER TO postgres;
+
+--
+-- Name: hdb_query_collection; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_query_collection (
+    collection_name text NOT NULL,
+    collection_defn jsonb NOT NULL,
+    comment text,
+    is_system_defined boolean DEFAULT false
+);
+
+
+ALTER TABLE hdb_catalog.hdb_query_collection OWNER TO postgres;
+
+--
+-- Name: hdb_relationship; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_relationship (
+    table_schema name NOT NULL,
+    table_name name NOT NULL,
+    rel_name text NOT NULL,
+    rel_type text,
+    rel_def jsonb NOT NULL,
+    comment text,
+    is_system_defined boolean DEFAULT false,
+    CONSTRAINT hdb_relationship_rel_type_check CHECK ((rel_type = ANY (ARRAY['object'::text, 'array'::text])))
+);
+
+
+ALTER TABLE hdb_catalog.hdb_relationship OWNER TO postgres;
+
+--
+-- Name: hdb_remote_relationship; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_remote_relationship (
+    remote_relationship_name text NOT NULL,
+    table_schema name NOT NULL,
+    table_name name NOT NULL,
+    definition jsonb NOT NULL
+);
+
+
+ALTER TABLE hdb_catalog.hdb_remote_relationship OWNER TO postgres;
+
+--
+-- Name: hdb_role; Type: VIEW; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE VIEW hdb_catalog.hdb_role AS
+ SELECT DISTINCT q.role_name
+   FROM ( SELECT hdb_permission.role_name
+           FROM hdb_catalog.hdb_permission
+        UNION ALL
+         SELECT hdb_action_permission.role_name
+           FROM hdb_catalog.hdb_action_permission) q;
+
+
+ALTER TABLE hdb_catalog.hdb_role OWNER TO postgres;
+
+--
+-- Name: hdb_scheduled_event_invocation_logs; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_scheduled_event_invocation_logs (
+    id text DEFAULT public.gen_random_uuid() NOT NULL,
+    event_id text,
+    status integer,
+    request json,
+    response json,
+    created_at timestamp without time zone DEFAULT now()
+);
+
+
+ALTER TABLE hdb_catalog.hdb_scheduled_event_invocation_logs OWNER TO postgres;
+
+--
+-- Name: hdb_scheduled_events; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_scheduled_events (
+    id text DEFAULT public.gen_random_uuid() NOT NULL,
+    webhook_conf json NOT NULL,
+    scheduled_time timestamp with time zone NOT NULL,
+    retry_conf json,
+    payload json,
+    header_conf json,
+    status text DEFAULT 'scheduled'::text NOT NULL,
+    tries integer DEFAULT 0 NOT NULL,
+    created_at timestamp without time zone DEFAULT now(),
+    next_retry_at timestamp with time zone,
+    comment text,
+    CONSTRAINT valid_status CHECK ((status = ANY (ARRAY['scheduled'::text, 'locked'::text, 'delivered'::text, 'error'::text, 'dead'::text])))
+);
+
+
+ALTER TABLE hdb_catalog.hdb_scheduled_events OWNER TO postgres;
+
+--
+-- Name: hdb_schema_update_event; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_schema_update_event (
+    instance_id uuid NOT NULL,
+    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
+    invalidations json NOT NULL
+);
+
+
+ALTER TABLE hdb_catalog.hdb_schema_update_event OWNER TO postgres;
+
+--
+-- Name: hdb_table; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_table (
+    table_schema name NOT NULL,
+    table_name name NOT NULL,
+    configuration jsonb,
+    is_system_defined boolean DEFAULT false,
+    is_enum boolean DEFAULT false NOT NULL
+);
+
+
+ALTER TABLE hdb_catalog.hdb_table OWNER TO postgres;
+
+--
+-- Name: hdb_table_info_agg; Type: VIEW; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE VIEW hdb_catalog.hdb_table_info_agg AS
+ SELECT schema.nspname AS table_schema,
+    "table".relname AS table_name,
+    jsonb_build_object('oid', ("table".oid)::integer, 'columns', COALESCE(columns.info, '[]'::jsonb), 'primary_key', primary_key.info, 'unique_constraints', COALESCE(unique_constraints.info, '[]'::jsonb), 'foreign_keys', COALESCE(foreign_key_constraints.info, '[]'::jsonb), 'view_info',
+        CASE "table".relkind
+            WHEN 'v'::"char" THEN jsonb_build_object('is_updatable', ((pg_relation_is_updatable(("table".oid)::regclass, true) & 4) = 4), 'is_insertable', ((pg_relation_is_updatable(("table".oid)::regclass, true) & 8) = 8), 'is_deletable', ((pg_relation_is_updatable(("table".oid)::regclass, true) & 16) = 16))
+            ELSE NULL::jsonb
+        END, 'description', description.description) AS info
+   FROM ((((((pg_class "table"
+     JOIN pg_namespace schema ON ((schema.oid = "table".relnamespace)))
+     LEFT JOIN pg_description description ON (((description.classoid = ('pg_class'::regclass)::oid) AND (description.objoid = "table".oid) AND (description.objsubid = 0))))
+     LEFT JOIN LATERAL ( SELECT jsonb_agg(jsonb_build_object('name', "column".attname, 'position', "column".attnum, 'type', COALESCE(base_type.typname, type.typname), 'is_nullable', (NOT "column".attnotnull), 'description', col_description("table".oid, ("column".attnum)::integer))) AS info
+           FROM ((pg_attribute "column"
+             LEFT JOIN pg_type type ON ((type.oid = "column".atttypid)))
+             LEFT JOIN pg_type base_type ON (((type.typtype = 'd'::"char") AND (base_type.oid = type.typbasetype))))
+          WHERE (("column".attrelid = "table".oid) AND ("column".attnum > 0) AND (NOT "column".attisdropped))) columns ON (true))
+     LEFT JOIN LATERAL ( SELECT jsonb_build_object('constraint', jsonb_build_object('name', class.relname, 'oid', (class.oid)::integer), 'columns', COALESCE(columns_1.info, '[]'::jsonb)) AS info
+           FROM ((pg_index index
+             JOIN pg_class class ON ((class.oid = index.indexrelid)))
+             LEFT JOIN LATERAL ( SELECT jsonb_agg("column".attname) AS info
+                   FROM pg_attribute "column"
+                  WHERE (("column".attrelid = "table".oid) AND ("column".attnum = ANY ((index.indkey)::smallint[])))) columns_1 ON (true))
+          WHERE ((index.indrelid = "table".oid) AND index.indisprimary)) primary_key ON (true))
+     LEFT JOIN LATERAL ( SELECT jsonb_agg(jsonb_build_object('name', class.relname, 'oid', (class.oid)::integer)) AS info
+           FROM (pg_index index
+             JOIN pg_class class ON ((class.oid = index.indexrelid)))
+          WHERE ((index.indrelid = "table".oid) AND index.indisunique AND (NOT index.indisprimary))) unique_constraints ON (true))
+     LEFT JOIN LATERAL ( SELECT jsonb_agg(jsonb_build_object('constraint', jsonb_build_object('name', foreign_key.constraint_name, 'oid', foreign_key.constraint_oid), 'columns', foreign_key.columns, 'foreign_table', jsonb_build_object('schema', foreign_key.ref_table_table_schema, 'name', foreign_key.ref_table), 'foreign_columns', foreign_key.ref_columns)) AS info
+           FROM hdb_catalog.hdb_foreign_key_constraint foreign_key
+          WHERE ((foreign_key.table_schema = schema.nspname) AND (foreign_key.table_name = "table".relname))) foreign_key_constraints ON (true))
+  WHERE ("table".relkind = ANY (ARRAY['r'::"char", 't'::"char", 'v'::"char", 'm'::"char", 'f'::"char", 'p'::"char"]));
+
+
+ALTER TABLE hdb_catalog.hdb_table_info_agg OWNER TO postgres;
+
+--
+-- Name: hdb_unique_constraint; Type: VIEW; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE VIEW hdb_catalog.hdb_unique_constraint AS
+ SELECT tc.table_name,
+    tc.constraint_schema AS table_schema,
+    tc.constraint_name,
+    json_agg(kcu.column_name) AS columns
+   FROM (information_schema.table_constraints tc
+     JOIN information_schema.key_column_usage kcu USING (constraint_schema, constraint_name))
+  WHERE ((tc.constraint_type)::text = 'UNIQUE'::text)
+  GROUP BY tc.table_name, tc.constraint_schema, tc.constraint_name;
+
+
+ALTER TABLE hdb_catalog.hdb_unique_constraint OWNER TO postgres;
+
+--
+-- Name: hdb_version; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.hdb_version (
+    hasura_uuid uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    version text NOT NULL,
+    upgraded_on timestamp with time zone NOT NULL,
+    cli_state jsonb DEFAULT '{}'::jsonb NOT NULL,
+    console_state jsonb DEFAULT '{}'::jsonb NOT NULL
+);
+
+
+ALTER TABLE hdb_catalog.hdb_version OWNER TO postgres;
+
+--
+-- Name: remote_schemas; Type: TABLE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TABLE hdb_catalog.remote_schemas (
+    id bigint NOT NULL,
+    name text,
+    definition json,
+    comment text
+);
+
+
+ALTER TABLE hdb_catalog.remote_schemas OWNER TO postgres;
+
+--
+-- Name: remote_schemas_id_seq; Type: SEQUENCE; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE SEQUENCE hdb_catalog.remote_schemas_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE hdb_catalog.remote_schemas_id_seq OWNER TO postgres;
+
+--
+-- Name: remote_schemas_id_seq; Type: SEQUENCE OWNED BY; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER SEQUENCE hdb_catalog.remote_schemas_id_seq OWNED BY hdb_catalog.remote_schemas.id;
+
+
+--
+-- Name: algo; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.algo (
+    id character varying NOT NULL,
+    name character varying,
+    "desc" text,
+    timeframe timestamp with time zone,
+    type character varying
+);
+
+
+ALTER TABLE public.algo OWNER TO postgres;
+
+--
+-- Name: asset; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.asset (
+    name character varying NOT NULL,
+    symbol character varying NOT NULL,
+    "order" integer,
+    symbol_icon text,
+    id integer NOT NULL
+);
+
+
+ALTER TABLE public.asset OWNER TO postgres;
+
+--
+-- Name: asset_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.asset_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.asset_id_seq OWNER TO postgres;
+
+--
+-- Name: asset_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.asset_id_seq OWNED BY public.asset.id;
+
+
+--
+-- Name: current_assets; Type: VIEW; Schema: public; Owner: postgres
+--
+
+CREATE VIEW public.current_assets AS
+SELECT
+    NULL::character varying AS name,
+    NULL::character varying AS symbol,
+    NULL::integer AS "order",
+    NULL::text AS symbol_icon,
+    NULL::integer AS id;
+
+
+ALTER TABLE public.current_assets OWNER TO postgres;
+
+--
+-- Name: history_signal; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.history_signal (
+    id integer NOT NULL,
+    history jsonb,
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+ALTER TABLE public.history_signal OWNER TO postgres;
+
+--
+-- Name: signal; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.signal (
+    category character varying NOT NULL,
+    algo_id character varying NOT NULL,
+    open_price real NOT NULL,
+    current_price real NOT NULL,
+    close_price real,
+    success_factor real NOT NULL,
+    strength real NOT NULL,
+    status character varying NOT NULL,
+    "position" character varying,
+    signal_type character varying,
+    updated_at timestamp with time zone DEFAULT now(),
+    created_at timestamp with time zone DEFAULT now(),
+    open_time timestamp with time zone,
+    close_time timestamp with time zone,
+    is_noti boolean DEFAULT false,
+    asset_id integer NOT NULL,
+    id integer NOT NULL
+);
+
+
+ALTER TABLE public.signal OWNER TO postgres;
+
+--
+-- Name: serialized_signals; Type: VIEW; Schema: public; Owner: postgres
+--
+
+CREATE VIEW public.serialized_signals AS
+ SELECT signal.id,
+    signal.asset_id,
+    signal.category,
+    signal.algo_id,
+    signal.open_price,
+    signal.current_price,
+    signal.close_price,
+    signal.success_factor,
+    signal.strength,
+    signal.status,
+    signal.open_time,
+    signal.close_time,
+    signal."position",
+    signal.signal_type,
+    (((signal.current_price - signal.open_price) / signal.open_price) * (100)::double precision) AS gain_percent,
+    (signal.current_price - signal.open_price) AS gain_value
+   FROM public.signal;
+
+
+ALTER TABLE public.serialized_signals OWNER TO postgres;
+
+--
+-- Name: settings; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.settings (
+    term_of_service text,
+    id integer NOT NULL
+);
+
+
+ALTER TABLE public.settings OWNER TO postgres;
+
+--
+-- Name: settings_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.settings_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.settings_id_seq OWNER TO postgres;
+
+--
+-- Name: settings_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.settings_id_seq OWNED BY public.settings.id;
+
+
+--
+-- Name: remote_schemas id; Type: DEFAULT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.remote_schemas ALTER COLUMN id SET DEFAULT nextval('hdb_catalog.remote_schemas_id_seq'::regclass);
+
+
+--
+-- Name: settings id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.settings ALTER COLUMN id SET DEFAULT nextval('public.settings_id_seq'::regclass);
+
+
+--
+-- Data for Name: event_invocation_logs; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.event_invocation_logs (id, event_id, status, request, response, created_at) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_log; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.event_log (id, schema_name, table_name, trigger_name, payload, delivered, error, tries, created_at, locked, next_retry_at, archived) FROM stdin;
+\.
+
+
+--
+-- Data for Name: event_triggers; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.event_triggers (name, type, schema_name, table_name, configuration, comment) FROM stdin;
+\.
+
+
+--
+-- Data for Name: hdb_action; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_action (action_name, action_defn, comment, is_system_defined) FROM stdin;
+\.
+
+
+--
+-- Data for Name: hdb_action_log; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_action_log (id, action_name, input_payload, request_headers, session_variables, response_payload, errors, created_at, response_received_at, status) FROM stdin;
+\.
+
+
+--
+-- Data for Name: hdb_action_permission; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_action_permission (action_name, role_name, definition, comment) FROM stdin;
+\.
+
+
+--
+-- Data for Name: hdb_allowlist; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_allowlist (collection_name) FROM stdin;
+\.
+
+
+--
+-- Data for Name: hdb_computed_field; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_computed_field (table_schema, table_name, computed_field_name, definition, comment) FROM stdin;
+\.
+
+
+--
+-- Data for Name: hdb_cron_event_invocation_logs; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_cron_event_invocation_logs (id, event_id, status, request, response, created_at) FROM stdin;
+\.
+
+
+--
+-- Data for Name: hdb_cron_events; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_cron_events (id, trigger_name, scheduled_time, status, tries, created_at, next_retry_at) FROM stdin;
+\.
+
+
+--
+-- Data for Name: hdb_cron_triggers; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_cron_triggers (name, webhook_conf, cron_schedule, payload, retry_conf, header_conf, include_in_metadata, comment) FROM stdin;
+\.
+
+
+--
+-- Data for Name: hdb_custom_types; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_custom_types (custom_types) FROM stdin;
+{"enums": null, "objects": null, "scalars": null, "input_objects": null}
+\.
+
+
+--
+-- Data for Name: hdb_function; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_function (function_schema, function_name, configuration, is_system_defined) FROM stdin;
+\.
+
+
+--
+-- Data for Name: hdb_permission; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_permission (table_schema, table_name, role_name, perm_type, perm_def, comment, is_system_defined) FROM stdin;
+public	settings	anonymous	select	{"filter": {}, "columns": ["term_of_service", "id"], "computed_fields": [], "allow_aggregations": false}	\N	f
+\.
+
+
+--
+-- Data for Name: hdb_query_collection; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_query_collection (collection_name, collection_defn, comment, is_system_defined) FROM stdin;
+\.
+
+
+--
+-- Data for Name: hdb_relationship; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_relationship (table_schema, table_name, rel_name, rel_type, rel_def, comment, is_system_defined) FROM stdin;
+hdb_catalog	hdb_table	detail	object	{"manual_configuration": {"remote_table": {"name": "tables", "schema": "information_schema"}, "column_mapping": {"table_name": "table_name", "table_schema": "table_schema"}}}	\N	t
+hdb_catalog	hdb_table	primary_key	object	{"manual_configuration": {"remote_table": {"name": "hdb_primary_key", "schema": "hdb_catalog"}, "column_mapping": {"table_name": "table_name", "table_schema": "table_schema"}}}	\N	t
+hdb_catalog	hdb_table	columns	array	{"manual_configuration": {"remote_table": {"name": "columns", "schema": "information_schema"}, "column_mapping": {"table_name": "table_name", "table_schema": "table_schema"}}}	\N	t
+hdb_catalog	hdb_table	foreign_key_constraints	array	{"manual_configuration": {"remote_table": {"name": "hdb_foreign_key_constraint", "schema": "hdb_catalog"}, "column_mapping": {"table_name": "table_name", "table_schema": "table_schema"}}}	\N	t
+hdb_catalog	hdb_table	relationships	array	{"manual_configuration": {"remote_table": {"name": "hdb_relationship", "schema": "hdb_catalog"}, "column_mapping": {"table_name": "table_name", "table_schema": "table_schema"}}}	\N	t
+hdb_catalog	hdb_table	permissions	array	{"manual_configuration": {"remote_table": {"name": "hdb_permission_agg", "schema": "hdb_catalog"}, "column_mapping": {"table_name": "table_name", "table_schema": "table_schema"}}}	\N	t
+hdb_catalog	hdb_table	computed_fields	array	{"manual_configuration": {"remote_table": {"name": "hdb_computed_field", "schema": "hdb_catalog"}, "column_mapping": {"table_name": "table_name", "table_schema": "table_schema"}}}	\N	t
+hdb_catalog	hdb_table	check_constraints	array	{"manual_configuration": {"remote_table": {"name": "hdb_check_constraint", "schema": "hdb_catalog"}, "column_mapping": {"table_name": "table_name", "table_schema": "table_schema"}}}	\N	t
+hdb_catalog	hdb_table	unique_constraints	array	{"manual_configuration": {"remote_table": {"name": "hdb_unique_constraint", "schema": "hdb_catalog"}, "column_mapping": {"table_name": "table_name", "table_schema": "table_schema"}}}	\N	t
+hdb_catalog	event_triggers	events	array	{"manual_configuration": {"remote_table": {"name": "event_log", "schema": "hdb_catalog"}, "column_mapping": {"name": "trigger_name"}}}	\N	t
+hdb_catalog	event_log	trigger	object	{"manual_configuration": {"remote_table": {"name": "event_triggers", "schema": "hdb_catalog"}, "column_mapping": {"trigger_name": "name"}}}	\N	t
+hdb_catalog	event_log	logs	array	{"foreign_key_constraint_on": {"table": {"name": "event_invocation_logs", "schema": "hdb_catalog"}, "column": "event_id"}}	\N	t
+hdb_catalog	event_invocation_logs	event	object	{"foreign_key_constraint_on": "event_id"}	\N	t
+hdb_catalog	hdb_function_agg	return_table_info	object	{"manual_configuration": {"remote_table": {"name": "hdb_table", "schema": "hdb_catalog"}, "column_mapping": {"return_type_name": "table_name", "return_type_schema": "table_schema"}}}	\N	t
+hdb_catalog	hdb_action	permissions	array	{"manual_configuration": {"remote_table": {"name": "hdb_action_permission", "schema": "hdb_catalog"}, "column_mapping": {"action_name": "action_name"}}}	\N	t
+hdb_catalog	hdb_role	action_permissions	array	{"manual_configuration": {"remote_table": {"name": "hdb_action_permission", "schema": "hdb_catalog"}, "column_mapping": {"role_name": "role_name"}}}	\N	t
+hdb_catalog	hdb_role	permissions	array	{"manual_configuration": {"remote_table": {"name": "hdb_permission_agg", "schema": "hdb_catalog"}, "column_mapping": {"role_name": "role_name"}}}	\N	t
+hdb_catalog	hdb_cron_triggers	cron_events	array	{"foreign_key_constraint_on": {"table": {"name": "hdb_cron_events", "schema": "hdb_catalog"}, "column": "trigger_name"}}	\N	t
+hdb_catalog	hdb_cron_events	cron_trigger	object	{"foreign_key_constraint_on": "trigger_name"}	\N	t
+hdb_catalog	hdb_cron_events	cron_event_logs	array	{"foreign_key_constraint_on": {"table": {"name": "hdb_cron_event_invocation_logs", "schema": "hdb_catalog"}, "column": "event_id"}}	\N	t
+hdb_catalog	hdb_cron_event_invocation_logs	cron_event	object	{"foreign_key_constraint_on": "event_id"}	\N	t
+hdb_catalog	hdb_scheduled_events	scheduled_event_logs	array	{"foreign_key_constraint_on": {"table": {"name": "hdb_scheduled_event_invocation_logs", "schema": "hdb_catalog"}, "column": "event_id"}}	\N	t
+hdb_catalog	hdb_scheduled_event_invocation_logs	scheduled_event	object	{"foreign_key_constraint_on": "event_id"}	\N	t
+public	asset	signals	array	{"foreign_key_constraint_on": {"table": {"name": "signal", "schema": "public"}, "column": "asset_id"}}	\N	f
+public	current_assets	serialized_signals	array	{"manual_configuration": {"remote_table": {"name": "serialized_signals", "schema": "public"}, "column_mapping": {"id": "asset_id"}}}	\N	f
+public	serialized_signals	asset	object	{"manual_configuration": {"remote_table": {"name": "asset", "schema": "public"}, "column_mapping": {"asset_id": "id"}}}	\N	f
+public	signal	algo	object	{"foreign_key_constraint_on": "algo_id"}	\N	f
+public	signal	asset	object	{"foreign_key_constraint_on": "asset_id"}	\N	f
+\.
+
+
+--
+-- Data for Name: hdb_remote_relationship; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_remote_relationship (remote_relationship_name, table_schema, table_name, definition) FROM stdin;
+\.
+
+
+--
+-- Data for Name: hdb_scheduled_event_invocation_logs; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_scheduled_event_invocation_logs (id, event_id, status, request, response, created_at) FROM stdin;
+\.
+
+
+--
+-- Data for Name: hdb_scheduled_events; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_scheduled_events (id, webhook_conf, scheduled_time, retry_conf, payload, header_conf, status, tries, created_at, next_retry_at, comment) FROM stdin;
+\.
+
+
+--
+-- Data for Name: hdb_schema_update_event; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_schema_update_event (instance_id, occurred_at, invalidations) FROM stdin;
+f3170c56-5bb8-475f-8acb-b5192ab2bd34	2020-09-07 07:19:46.918431+00	{"metadata":false,"remote_schemas":[]}
+\.
+
+
+--
+-- Data for Name: hdb_table; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_table (table_schema, table_name, configuration, is_system_defined, is_enum) FROM stdin;
+information_schema	tables	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+information_schema	schemata	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+information_schema	views	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+information_schema	columns	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_table	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_primary_key	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_foreign_key_constraint	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_relationship	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_permission_agg	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_computed_field	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_check_constraint	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_unique_constraint	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_remote_relationship	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	event_triggers	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	event_log	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	event_invocation_logs	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_function	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_function_agg	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	remote_schemas	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_version	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_query_collection	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_allowlist	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_custom_types	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_action_permission	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_action	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_action_log	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_role	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_cron_triggers	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_cron_events	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_cron_event_invocation_logs	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_scheduled_events	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+hdb_catalog	hdb_scheduled_event_invocation_logs	{"custom_root_fields": {}, "custom_column_names": {}}	t	f
+public	algo	{"custom_root_fields": {}, "custom_column_names": {}}	f	f
+public	asset	{"custom_root_fields": {}, "custom_column_names": {}}	f	f
+public	current_assets	{"custom_root_fields": {}, "custom_column_names": {}}	f	f
+public	serialized_signals	{"custom_root_fields": {}, "custom_column_names": {}}	f	f
+public	settings	{"custom_root_fields": {}, "custom_column_names": {}}	f	f
+public	signal	{"custom_root_fields": {}, "custom_column_names": {}}	f	f
+public	history_signal	{"custom_root_fields": {}, "custom_column_names": {}}	f	f
+\.
+
+
+--
+-- Data for Name: hdb_version; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.hdb_version (hasura_uuid, version, upgraded_on, cli_state, console_state) FROM stdin;
+b1f2ab47-19d5-4fde-83dd-0a713dd3b956	37	2020-08-24 04:44:06.646299+00	{}	{"telemetryNotificationShown": true}
+\.
+
+
+--
+-- Data for Name: remote_schemas; Type: TABLE DATA; Schema: hdb_catalog; Owner: postgres
+--
+
+COPY hdb_catalog.remote_schemas (id, name, definition, comment) FROM stdin;
+\.
+
+
+--
+-- Data for Name: algo; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.algo (id, name, "desc", timeframe, type) FROM stdin;
+crypto_001	crypto_001	\N	\N	\N
+\.
+
+
+--
+-- Data for Name: asset; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.asset (name, symbol, "order", symbol_icon, id) FROM stdin;
+Bitcoin	BTC	1	https://upload.wikimedia.org/wikipedia/commons/thumb/4/46/Bitcoin.svg/1200px-Bitcoin.svg.png	1
+Ethereum	ETH	2	https://upload.wikimedia.org/wikipedia/commons/thumb/6/6f/Ethereum-icon-purple.svg/1200px-Ethereum-icon-purple.svg.png	2
+Litecoin	LTC	3	https://cdn3.iconfinder.com/data/icons/currency-and-cryptocurrency-signs/64/cryptocurrency_blockchain_Litecoin_LTC-512.png	3
+Ripple	XRP	4	https://cdn3.iconfinder.com/data/icons/currency-and-cryptocurrency-signs/64/cryptocurrency_blockchain_Ripple_XRP-512.png	4
+\.
+
+
+--
+-- Data for Name: history_signal; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.history_signal (id, history, updated_at) FROM stdin;
+1040	[{"asset": {"symbol": "XRP", "__typename": "asset"}, "status": "active", "algo_id": "crypto_001", "asset_id": 4, "category": "long-term", "position": "Short", "strength": 2, "open_time": "2020-07-29T22:30:46.027+00:00", "close_time": null, "open_price": 2, "close_price": null, "signal_type": "Buy", "current_price": 2, "success_factor": 21.6}, {"asset": {"symbol": "XRP", "__typename": "asset"}, "status": "active", "algo_id": "crypto_001", "asset_id": 4, "category": "long-term", "position": "Short", "strength": 3, "open_time": "2020-07-29T22:30:46.027+00:00", "close_time": null, "open_price": 3, "close_price": null, "signal_type": "Buy", "current_price": 3, "success_factor": 21.6}, {"asset": {"symbol": "XRP", "__typename": "asset"}, "status": "active", "algo_id": "crypto_001", "asset_id": 4, "category": "long-term", "position": "Short", "strength": 6, "open_time": "2020-07-29T22:30:46.027+00:00", "close_time": null, "open_price": 4, "close_price": null, "signal_type": "Buy", "current_price": 5, "success_factor": 21.6}, {"asset": {"symbol": "XRP", "__typename": "asset"}, "status": "active", "algo_id": "crypto_001", "asset_id": 4, "category": "long-term", "position": "Short", "strength": 6, "open_time": "2020-07-29T22:30:46.027+00:00", "close_time": null, "open_price": 4, "close_price": null, "signal_type": "Buy", "current_price": 5, "success_factor": 21.6}]	2020-08-22 11:28:37.728058+00
+64350	[{"asset": {"symbol": "XRP", "__typename": "asset"}, "status": "active", "algo_id": "crypto_001", "asset_id": 4, "category": "long-term", "position": "Short", "strength": 6, "open_time": "2020-07-29T22:30:46.027+00:00", "close_time": null, "open_price": 7, "close_price": null, "signal_type": "Buy", "current_price": 8, "success_factor": 21.6}, {"asset": {"symbol": "XRP", "__typename": "asset"}, "status": "active", "algo_id": "crypto_001", "asset_id": 4, "category": "short-term", "position": "Short", "strength": 6, "open_time": "2020-07-29T22:30:46.027+00:00", "close_time": null, "open_price": 7, "close_price": null, "signal_type": "Buy", "current_price": 8, "success_factor": 21.6}, {"asset": {"symbol": "XRP", "__typename": "asset"}, "status": "active", "algo_id": "crypto_001", "asset_id": 4, "category": "short-term", "position": "Short", "strength": 6, "open_time": "2020-07-29T22:30:46.027+00:00", "close_time": null, "open_price": 7, "close_price": null, "signal_type": "Buy", "current_price": 921213, "success_factor": 21.6}]	2020-08-24 04:56:18.233183+00
+\.
+
+
+--
+-- Data for Name: settings; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.settings (term_of_service, id) FROM stdin;
+Our Terms and Conditions of Service\nLast Revised: July 14, 2020\nPlease read the following terms and conditions carefully before you use services from Gutenberg. Your use of the products by Gutenberg will be subject to these terms and conditions and by using the products of Gutenberg you agree to be bound by them.\n\n1. Introduction\nGutenberg ("Gutenberg", “Stratopy LLC”, "We", "Us," "Our") develops mobile applications ("Our Products"). Our Apple Applications may be downloaded from the App Store, which is operated and owned by Apple Inc. and other companies within its group ("Apple"). Our Android Applications may be downloaded from Google Play, which is owned and operated by Google Inc. and other companies within its group ("Google"). We develop Our Products for informational purposes only. You must ALWAYS consult your financial advisor before trading using any information provided by our apps. By agreeing to these Terms and Conditions you confirm that you are solely responsible for your state of finances as well as any risks you take.\n\n2. Acceptance of Terms and Conditions\nBy using Our Products and Services you accept these Terms and Conditions. If you do not accept these Terms and Conditions, you may choose not to use Our Products and Services. Gutenberg reserves the right to amend these Terms and Conditions at any time without prior notice. The up-to-date version of these Terms and Conditions will be available on the official website of Gutenberg and any changes will come into effect immediately upon posting. By continuing to use Our Products you agree to our current or amended terms and conditions.\n\nBy using our app, services, and sites, you opt-in to allow Gutenberg and its affiliates, subsidiaries, and partners to send you marketing emails, offer emails, and any other emails to the email address you are using to sign up and login to our app and/or services.\n\n3. Intellectual Property\nThe texts, graphics, designs, logos, button icons, images, data compilations and information ("Content") contained in Our Products and Services are Intellectual Property of Gutenberg (or belongs to it) and are protected by copyright laws. All logos and trademarks displayed in Our Products and Services are registered trademarks or trademarks of Gutenberg. No trademarks may be used without prior written consent of Gutenberg except to identify the products or services associated therewith. Our Products and all related software, and all patent rights (including patent applications and disclosures), copyrights, trade secrets, know-how, and any other intellectual property rights therein or relating thereto (including derivative works), are and shall remain the exclusive property of Stratopy, LLC or its licensors.\n\n4. Legality of Use\nBy using Our Products, you hereby warrant that: (i) all information contained in any submission by you is either owned by you or rights have been granted to you permitting you to disseminate the information as set forth in these Terms and Conditions; and (ii) the information contained in any submissions by you does not infringe on the intellectual property rights of others, including but not limited to, copyright, trademark, patent, or trade secret rights. You accept full responsibility, assume all risk, and waive and/or release Us from any direct or indirect loss, injury, claim or damage arising from your use of Our Products, whether or not such use was appropriately supervised and regardless of whether you were negligent in such use. By using Our Products, you attest and verify that you understand that our content is for information purposes ONLY and should not be used to actually trade, and knowingly accept and are fully aware of all risks associated with their use.\n\n5. Subscriptions\nGutenberg Premium Membership subscriptions grant you access to receive trading signals. Payments will be charged to iTunes Account or Google Play at confirmation of purchase. Paid Subscriptions automatically renew until cancelled in the Manage Subscriptions section of your account settings. We will notify you if the price of a Paid Subscription increases and, if required, seek your consent to continue. You will be charged no more than 24 hours prior to the start of the latest Paid Subscription period. Certain Paid Subscriptions may offer a free trial prior to charging your payment method. If you decide to unsubscribe from a Paid Subscription before we start charging your payment method, cancel the subscription before the free trial ends.\n\n6. Representations and Warranties, Limitation of Liability\nGutenberg makes no representations regarding: (a) the credentials of anyone using our Services and/or Products as part of any financial services; (b) the suitability of the exercises included in any such POC; (c) the viability, financial soundness or efficacy of any such POC; or (d) the overall financial benefits you might derive from using our services and products or POC which incorporates our services and products. The use of any software or hardware offered by Gutenberg is no substitute for financial consultation. Our Services and Products are provided "as is" without any warranties, expressed or implied, including but not limited to the implied warranties of merchantability, used for a particular purpose, or non-infringement. Gutenberg makes no representation or warranty that the information contained in our Services and/or Products will be current, timely, complete, accurate or error-free. To the extent that the law does not permit the disclaimer of warranties, all content accessible in our services and products, or any other web site to which our services and products link, is warranted only to the minimum amount legally required. In no event shall Gutenberg be liable to any party for any direct, indirect, special or other consequential damages for any use of this in our services and products, or on any linked web site, including, without limitation, any lost profits, business interruption or otherwise.\n\n7. Privacy Policy\nSee Privacy Policy and GDPR Policy provided below in Section Privacy Policy\n8. Maintenance\nGutenberg. is not responsible for any outages or service interruptions that occur from time-to-time when using Our Products, including those due to software, hardware or power failures, or issues at the wireless carrier level. In addition, Gutenberg. is not responsible for the products and services provided by others, including any Userâ€™s mobile handsets or wireless data networks. Gutenberg., in its sole discretion, reserves the right to add or remove operating systems based on commercial factors it deems relevant such as use, adoption and appeal of the operating system.\n\n9. Content Created by Users and Rights to such Content\nThe user consents that as a result of the automatic evaluation of the way the user uses Our Products, he/she may be exposed to certain offers and/or marketing messages tailored to such user. The user consents that marketing measures may also be taken in relation to created content, which are marketed by Gutenberg. The user grants Gutenberg the irrevocable, free, non-exclusive and unlimited right to use all content generated, transmitted, saved and published by such user. Accordingly, Gutenberg shall have the right to use all content, irrespective of the type of usage. This shall include the right to change and edit such content, unless such changes or edits impair material interests of the user. In this connection, the user waives, to the extent legally permissible, all intellectual property rights. Gutenberg does not claim ownership of any content created by users and will not supervise such content.\n\n10. Territory\nThe term "Territory" means the United States, its territories possessions, North America, the United Kingdom and Australia. Any additional Territories shall be subject to mutual approval.\n\n11. Governing Law\nThese Terms and Conditions, any non-contractual obligations arising in connection with them and litigation between the users and Gutenberg shall be subject to the US law only. The state and federal courts in Houston, Texas, shall have non-exclusive jurisdiction to determine any dispute arising in connection with these Terms and Conditions, including disputes relating to any non-contractual obligations. \n\nBy using the app and its information, you agree and understand the following:\n\n** Results may not be typical and may vary from person to person. Making money trading stocks takes time, dedication, and hard work. There are inherent risks involved with investing in the stock market, including the loss of your investment. Past performance in the market is not indicative of future results. Any investment is at your own risk. See Terms of Service here.. \n\nThis is for information purposes only as Stratopy, LLC nor any of its directors, officers, investors, advisor, or any affiliates are registered as a securities broker-dealer or an investment adviser. No information herein is intended as securities brokerage, investment, tax, accounting or legal advice, as an offer or solicitation of an offer to sell or buy, or as an endorsement, recommendation or sponsorship of any company, security or fund. Stratopy, LLC nor any of its directors, officers, investors, advisor, or any affiliates cannot and does not assess, verify or guarantee the adequacy, accuracy or completeness of any information, the suitability or profitability of any particular investment, or the potential value of any investment or informational source. The user bears responsibility for his/her own investment research and decisions, should seek the advice of a qualified securities professional before making any investment, and investigate and fully understand any and all risks before investing. Stratopy, LLC nor any of its directors, officers, investors, advisor, or any affiliates in no way warrants the solvency, financial condition, or investment advisability of any of the securities mentioned in communications or websites. In addition, Stratopy, LLC nor any of its directors, officers, investors, advisor, or any affiliates accepts no liability whatsoever for any direct or consequential loss arising from any use of this information. This information is not intended to be used as the sole basis of any investment decision, nor should it be construed as advice designed to meet the investment needs of any particular investor. Past performance is not necessarily indicative of future returns. \n\n\nDisclaimer\nYOU MUST READ AND AGREE. IF YOU DO NOT AGREE, YOU ARE FORBIDDEN TO USE OUR SERVICES. \n\nCryptocurrency Trading has large potential rewards, but also large potential risk. You must be aware of the risks and be willing to accept them in order to invest in Cryptocurrency. Do NOT trade with money you can't afford to lose. This is neither a solicitation nor an offer to Buy/Sell Cryptocurrency. No representation is being made that any account will or is likely to achieve profits or losses similar to those discussed on this app or on any reports. The past performance of any trading system, methodology, strategy, or results is not necessarily indicative of future results. \nIt should not be considered legal or financial advice. You should consult with an attorney or other professional to determine what may be best for your individual needs. \n\nGutenberg provides trading algorithms based on a computerized system. All advice is impersonal and not tailored to any specific individual's unique situation. Gutenberg, and its principles, are not required to register with the NFA as a CTA and are publicly claiming this exemption. Information posted online or distributed through this app has NOT been reviewed by any government agencies which includes but is not limited to signals, back-tested reports, statements and any other marketing materials. Carefully consider this prior to purchasing any Cryptocurrency based on our signals. For more information on the exemption we are claiming, please visit the NFA website: http://www.nfa.futures.org/nfa-registration/cta/index.html. If you are in need of professional advice unique to your situation, please consult with a licensed broker/CTA. \n\nGutenberg does not make any guarantee or other promise as to any results that may be obtained from using our content. No one should make any investment decision without first consulting his or her own financial advisor and conducting his or her own research and due diligence. To the maximum extent permitted by law, Gutenberg disclaims any and all liability in the event any information, commentary, analysis, opinions, advice and/or recommendations prove to be inaccurate, incomplete or unreliable, or result in any investment or other losses. \n\nUnless otherwise noted, all returns posted on this site and in our videos is considered Hypothetical Performance. HYPOTHETICAL PERFORMANCE RESULTS HAVE MANY INHERENT LIMITATIONS, SOME OF WHICH ARE DESCRIBED BELOW. NO REPRESENTATION IS BEING MADE THAT ANY ACCOUNT WILL OR IS LIKELY TO ACHIEVE PROFITS OR LOSSES SIMILAR TO THOSE SHOWN. IN FACT, THERE ARE FREQUENTLY SHARP DIFFERENCES BETWEEN HYPOTHETICAL PERFORMANCE RESULTS AND THE ACTUAL RESULTS SUBSEQUENTLY ACHIEVED BY ANY PARTICULAR TRADING PROGRAM. ONE OF THE LIMITATIONS OF HYPOTHETICAL PERFORMANCE RESULTS IS THAT THEY ARE GENERALLY PREPARED WITH THE BENEFIT OF HINDSIGHT. IN ADDITION, HYPOTHETICAL TRADING DOES NOT INVOLVE FINANCIAL RISK, AND NO HYPOTHETICAL TRADING RECORD CAN COMPLETELY ACCOUNT FOR THE IMPACT OF FINANCIAL RISK IN ACTUAL TRADING. FOR EXAMPLE, THE ABILITY TO WITHSTAND LOSSES OR ADHERE TO A PARTICULAR TRADING PROGRAM IN SPITE OF TRADING LOSSES ARE MATERIAL POINTS WHICH CAN ALSO ADVERSELY AFFECT ACTUAL TRADING RESULTS. THERE ARE NUMEROUS OTHER FACTORS RELATED TO THE MARKETS IN GENERAL OR TO THE IMPLEMENTATION OF ANY SPECIFIC TRADING PROGRAM WHICH CANNOT BE FULLY ACCOUNTED FOR IN THE PREPARATION OF HYPOTHETICAL PERFORMANCE RESULTS AND ALL OF WHICH CAN ADVERSELY AFFECT ACTUAL TRADING RESULTS. \n\nAll results, graphs and claims made on this website and in any video blogs and/or newsletter emails are from the result of back-testing our algorithms during the dates indicated. These results are not from live accounts trading our algorithms. They are from hypothetical accounts which have limitations (see CFTC RULE 4.14 below and Hypothetical performance disclaimer above). Actual results do vary given that simulated results could under or over compensate the impact of certain market factors. Furthermore, our algorithms use back-testing to generate trade lists and reports which does have the benefit of hind-sight. While back-tested results might have spectacular returns, once slippage, commission and licensing fees are taken into account, actual returns will vary. Posted maximum draw downs are measured on a closing month to closing month basis. Furthermore, they are based on back-tested data (refer to limitations of back-testing below). Actual draw downs could exceed these levels when traded on live accounts. \n\nCFTC RULE 4.41 - Hypothetical or simulated performance results have certain limitations. Unlike an actual performance record, simulated results do not represent actual trading. Also, since the trades have not been executed, the results may have under or over compensated for the impact, if any, of certain market factors, such as lack of liquidity. Simulated trading programs in general are also subject to the fact that they are designed with the benefit of hindsight. No representation is being made that any account will or is likely to achieve profit or losses similar to those shown.\n\nStatements posted from our actual customers trading the algorithms (algos) include slippage and commission. Statements posted are not fully audited or verified and should be considered as customer testimonials. Individual results do vary. They are real statements from real people trading our algorithms on auto-pilot and as far as we know, do NOT include any discretionary trades. \n\nThis strictly is for demonstration/educational purposes. Gutenberg does not make buy, sell or hold recommendations. Unique experiences and past performances do not guarantee future results. You should speak with your CTA or financial representative, broker dealer, or financial analyst to ensure that the software/strategy that you utilize is suitable for your investment profile before trading in a live brokerage account. All advice and/or suggestions given here are intended for running automated software in simulation mode only. Trading futures is not for everyone and does carry a high level of risk. Gutenberg, nor any of its principles, is NOT registered as an investment advisor.\n\n\n\nPrivacy Policy\nLast Revised: July 14, 2020\n\nThis page informs you of Stratopy, LLC’s (“Gutenberg”, “Us”, “We”, or “Our”) policies regarding the collection, use and disclosure of Personal Information we receive from users of the app. \n\nWe use your Personal Information only for providing and improving the App. By using the App, you agree to the collection and use of information in accordance with this policy. \n\nInformation Collection And Use \nWhile using our App, we may ask you to provide us with certain personally identifiable information that can be used to contact or identify you. Personally identifiable information may include, but is not limited to your name, email, phone number and/or Country.\n\nLog Data \nLike many App operators, we collect information that your device sends whenever you use our App ("Log Data"). \nThis Log Data may include information such as your device's Internet Protocol ("IP") address, browser type, browser version, the pages of our App that you visit, the time and date of your visit, the time spent on those pages and other statistics. In addition, we may use third party services such as Google Analytics that collect, monitor and analyze this.\n\nCommunications \nWe may use your Personal Information to contact you via email, marketing or promotional materials and other information that we believe fit within the confines of our app in terms of information or usefulness for our users.\n\nSecurity \nThe security of your Personal Information is important to us, but remember that no method of transmission over the Internet, or method of electronic storage, is 100% secure. While we strive to use commercially acceptable means to protect your Personal Information, we cannot guarantee its absolute security. \n\nChanges to this Privacy Policy: \nThis Privacy Policy is effective as of July 14, 2020 and will remain in effect except with respect to any changes in its provisions in the future, which will be in effect immediately after being posted on this page. \nWe reserve the right to update or change our Privacy Policy at any time and you should check this Privacy Policy periodically. Your continued use of the Service after we post any modifications to the Privacy Policy on this page will constitute your acknowledgment of the modifications and your consent to abide and be bound by the modified Privacy Policy. If we make any material changes to this Privacy Policy, we will notify you either through the email address you have provided us, or by placing a prominent notice on our App. \n\n	1
+\.
+
+
+--
+-- Data for Name: signal; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.signal (category, algo_id, open_price, current_price, close_price, success_factor, strength, status, "position", signal_type, updated_at, created_at, open_time, close_time, is_noti, asset_id, id) FROM stdin;
+long-term	crypto_001	7	8	\N	21.6	6	active	Short	Buy	2020-08-22 11:28:37.741414+00	2020-08-22 11:28:37.741414+00	2020-07-29 22:30:46.027+00	\N	t	4	1040
+Intraday	crypto_001	11438	567	\N	5.3123132e+07	123456	active	Long	Buy	2020-08-22 06:50:47.631489+00	2020-08-12 10:30:08.279912+00	2020-08-12 05:29:57.027+00	2020-07-29 22:30:46.027+00	t	1	1041
+short-term	crypto_001	7	921213	\N	21.6	6	active	Short	Buy	2020-08-24 04:56:18.276294+00	2020-08-24 04:56:18.276294+00	2020-07-29 22:30:46.027+00	\N	t	4	64350
+short-term	crypto_001	7	56709	\N	21.6	6	active	Short	Buy	2020-08-24 07:24:35.033098+00	2020-08-24 07:24:35.033098+00	2020-07-29 22:30:46.027+00	\N	t	4	32123
+\.
+
+
+--
+-- Name: remote_schemas_id_seq; Type: SEQUENCE SET; Schema: hdb_catalog; Owner: postgres
+--
+
+SELECT pg_catalog.setval('hdb_catalog.remote_schemas_id_seq', 1, false);
+
+
+--
+-- Name: asset_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.asset_id_seq', 4, true);
+
+
+--
+-- Name: settings_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.settings_id_seq', 2, true);
+
+
+--
+-- Name: event_invocation_logs event_invocation_logs_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.event_invocation_logs
+    ADD CONSTRAINT event_invocation_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: event_log event_log_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.event_log
+    ADD CONSTRAINT event_log_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: event_triggers event_triggers_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.event_triggers
+    ADD CONSTRAINT event_triggers_pkey PRIMARY KEY (name);
+
+
+--
+-- Name: hdb_action_log hdb_action_log_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_action_log
+    ADD CONSTRAINT hdb_action_log_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: hdb_action_permission hdb_action_permission_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_action_permission
+    ADD CONSTRAINT hdb_action_permission_pkey PRIMARY KEY (action_name, role_name);
+
+
+--
+-- Name: hdb_action hdb_action_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_action
+    ADD CONSTRAINT hdb_action_pkey PRIMARY KEY (action_name);
+
+
+--
+-- Name: hdb_allowlist hdb_allowlist_collection_name_key; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_allowlist
+    ADD CONSTRAINT hdb_allowlist_collection_name_key UNIQUE (collection_name);
+
+
+--
+-- Name: hdb_computed_field hdb_computed_field_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_computed_field
+    ADD CONSTRAINT hdb_computed_field_pkey PRIMARY KEY (table_schema, table_name, computed_field_name);
+
+
+--
+-- Name: hdb_cron_event_invocation_logs hdb_cron_event_invocation_logs_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_cron_event_invocation_logs
+    ADD CONSTRAINT hdb_cron_event_invocation_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: hdb_cron_events hdb_cron_events_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_cron_events
+    ADD CONSTRAINT hdb_cron_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: hdb_cron_triggers hdb_cron_triggers_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_cron_triggers
+    ADD CONSTRAINT hdb_cron_triggers_pkey PRIMARY KEY (name);
+
+
+--
+-- Name: hdb_function hdb_function_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_function
+    ADD CONSTRAINT hdb_function_pkey PRIMARY KEY (function_schema, function_name);
+
+
+--
+-- Name: hdb_permission hdb_permission_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_permission
+    ADD CONSTRAINT hdb_permission_pkey PRIMARY KEY (table_schema, table_name, role_name, perm_type);
+
+
+--
+-- Name: hdb_query_collection hdb_query_collection_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_query_collection
+    ADD CONSTRAINT hdb_query_collection_pkey PRIMARY KEY (collection_name);
+
+
+--
+-- Name: hdb_relationship hdb_relationship_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_relationship
+    ADD CONSTRAINT hdb_relationship_pkey PRIMARY KEY (table_schema, table_name, rel_name);
+
+
+--
+-- Name: hdb_remote_relationship hdb_remote_relationship_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_remote_relationship
+    ADD CONSTRAINT hdb_remote_relationship_pkey PRIMARY KEY (remote_relationship_name, table_schema, table_name);
+
+
+--
+-- Name: hdb_scheduled_event_invocation_logs hdb_scheduled_event_invocation_logs_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_scheduled_event_invocation_logs
+    ADD CONSTRAINT hdb_scheduled_event_invocation_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: hdb_scheduled_events hdb_scheduled_events_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_scheduled_events
+    ADD CONSTRAINT hdb_scheduled_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: hdb_table hdb_table_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_table
+    ADD CONSTRAINT hdb_table_pkey PRIMARY KEY (table_schema, table_name);
+
+
+--
+-- Name: hdb_version hdb_version_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_version
+    ADD CONSTRAINT hdb_version_pkey PRIMARY KEY (hasura_uuid);
+
+
+--
+-- Name: remote_schemas remote_schemas_name_key; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.remote_schemas
+    ADD CONSTRAINT remote_schemas_name_key UNIQUE (name);
+
+
+--
+-- Name: remote_schemas remote_schemas_pkey; Type: CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.remote_schemas
+    ADD CONSTRAINT remote_schemas_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: algo Algo_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.algo
+    ADD CONSTRAINT "Algo_pkey" PRIMARY KEY (id);
+
+
+--
+-- Name: asset asset_id_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.asset
+    ADD CONSTRAINT asset_id_key UNIQUE (id);
+
+
+--
+-- Name: asset asset_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.asset
+    ADD CONSTRAINT asset_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: history_signal history_signal_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.history_signal
+    ADD CONSTRAINT history_signal_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: settings settings_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.settings
+    ADD CONSTRAINT settings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: signal signal_id_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.signal
+    ADD CONSTRAINT signal_id_key UNIQUE (id);
+
+
+--
+-- Name: signal signal_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.signal
+    ADD CONSTRAINT signal_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: event_invocation_logs_event_id_idx; Type: INDEX; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE INDEX event_invocation_logs_event_id_idx ON hdb_catalog.event_invocation_logs USING btree (event_id);
+
+
+--
+-- Name: event_log_created_at_idx; Type: INDEX; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE INDEX event_log_created_at_idx ON hdb_catalog.event_log USING btree (created_at);
+
+
+--
+-- Name: event_log_delivered_idx; Type: INDEX; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE INDEX event_log_delivered_idx ON hdb_catalog.event_log USING btree (delivered);
+
+
+--
+-- Name: event_log_locked_idx; Type: INDEX; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE INDEX event_log_locked_idx ON hdb_catalog.event_log USING btree (locked);
+
+
+--
+-- Name: event_log_trigger_name_idx; Type: INDEX; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE INDEX event_log_trigger_name_idx ON hdb_catalog.event_log USING btree (trigger_name);
+
+
+--
+-- Name: hdb_cron_event_status; Type: INDEX; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE INDEX hdb_cron_event_status ON hdb_catalog.hdb_cron_events USING btree (status);
+
+
+--
+-- Name: hdb_scheduled_event_status; Type: INDEX; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE INDEX hdb_scheduled_event_status ON hdb_catalog.hdb_scheduled_events USING btree (status);
+
+
+--
+-- Name: hdb_schema_update_event_one_row; Type: INDEX; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE UNIQUE INDEX hdb_schema_update_event_one_row ON hdb_catalog.hdb_schema_update_event USING btree (((occurred_at IS NOT NULL)));
+
+
+--
+-- Name: hdb_version_one_row; Type: INDEX; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE UNIQUE INDEX hdb_version_one_row ON hdb_catalog.hdb_version USING btree (((version IS NOT NULL)));
+
+
+--
+-- Name: current_assets _RETURN; Type: RULE; Schema: public; Owner: postgres
+--
+
+CREATE OR REPLACE VIEW public.current_assets AS
+ SELECT asset.name,
+    asset.symbol,
+    asset."order",
+    asset.symbol_icon,
+    asset.id
+   FROM (public.asset
+     JOIN public.signal ON ((asset.id = signal.asset_id)))
+  WHERE ((signal.status)::text = 'active'::text)
+  GROUP BY asset.id;
+
+
+--
+-- Name: hdb_schema_update_event hdb_schema_update_event_notifier; Type: TRIGGER; Schema: hdb_catalog; Owner: postgres
+--
+
+CREATE TRIGGER hdb_schema_update_event_notifier AFTER INSERT OR UPDATE ON hdb_catalog.hdb_schema_update_event FOR EACH ROW EXECUTE FUNCTION hdb_catalog.hdb_schema_update_event_notifier();
+
+
+--
+-- Name: history_signal set_public_history_signal_updated_at; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER set_public_history_signal_updated_at BEFORE UPDATE ON public.history_signal FOR EACH ROW EXECUTE FUNCTION public.set_current_timestamp_updated_at();
+
+
+--
+-- Name: TRIGGER set_public_history_signal_updated_at ON history_signal; Type: COMMENT; Schema: public; Owner: postgres
+--
+
+COMMENT ON TRIGGER set_public_history_signal_updated_at ON public.history_signal IS 'trigger to set value of column "updated_at" to current timestamp on row update';
+
+
+--
+-- Name: signal set_public_signal_updated_at; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER set_public_signal_updated_at BEFORE UPDATE ON public.signal FOR EACH ROW EXECUTE FUNCTION public.set_current_timestamp_updated_at();
+
+
+--
+-- Name: TRIGGER set_public_signal_updated_at ON signal; Type: COMMENT; Schema: public; Owner: postgres
+--
+
+COMMENT ON TRIGGER set_public_signal_updated_at ON public.signal IS 'trigger to set value of column "updated_at" to current timestamp on row update';
+
+
+--
+-- Name: event_invocation_logs event_invocation_logs_event_id_fkey; Type: FK CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.event_invocation_logs
+    ADD CONSTRAINT event_invocation_logs_event_id_fkey FOREIGN KEY (event_id) REFERENCES hdb_catalog.event_log(id);
+
+
+--
+-- Name: event_triggers event_triggers_schema_name_table_name_fkey; Type: FK CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.event_triggers
+    ADD CONSTRAINT event_triggers_schema_name_table_name_fkey FOREIGN KEY (schema_name, table_name) REFERENCES hdb_catalog.hdb_table(table_schema, table_name) ON UPDATE CASCADE;
+
+
+--
+-- Name: hdb_action_permission hdb_action_permission_action_name_fkey; Type: FK CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_action_permission
+    ADD CONSTRAINT hdb_action_permission_action_name_fkey FOREIGN KEY (action_name) REFERENCES hdb_catalog.hdb_action(action_name) ON UPDATE CASCADE;
+
+
+--
+-- Name: hdb_allowlist hdb_allowlist_collection_name_fkey; Type: FK CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_allowlist
+    ADD CONSTRAINT hdb_allowlist_collection_name_fkey FOREIGN KEY (collection_name) REFERENCES hdb_catalog.hdb_query_collection(collection_name);
+
+
+--
+-- Name: hdb_computed_field hdb_computed_field_table_schema_table_name_fkey; Type: FK CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_computed_field
+    ADD CONSTRAINT hdb_computed_field_table_schema_table_name_fkey FOREIGN KEY (table_schema, table_name) REFERENCES hdb_catalog.hdb_table(table_schema, table_name) ON UPDATE CASCADE;
+
+
+--
+-- Name: hdb_cron_event_invocation_logs hdb_cron_event_invocation_logs_event_id_fkey; Type: FK CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_cron_event_invocation_logs
+    ADD CONSTRAINT hdb_cron_event_invocation_logs_event_id_fkey FOREIGN KEY (event_id) REFERENCES hdb_catalog.hdb_cron_events(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: hdb_cron_events hdb_cron_events_trigger_name_fkey; Type: FK CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_cron_events
+    ADD CONSTRAINT hdb_cron_events_trigger_name_fkey FOREIGN KEY (trigger_name) REFERENCES hdb_catalog.hdb_cron_triggers(name) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: hdb_permission hdb_permission_table_schema_table_name_fkey; Type: FK CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_permission
+    ADD CONSTRAINT hdb_permission_table_schema_table_name_fkey FOREIGN KEY (table_schema, table_name) REFERENCES hdb_catalog.hdb_table(table_schema, table_name) ON UPDATE CASCADE;
+
+
+--
+-- Name: hdb_relationship hdb_relationship_table_schema_table_name_fkey; Type: FK CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_relationship
+    ADD CONSTRAINT hdb_relationship_table_schema_table_name_fkey FOREIGN KEY (table_schema, table_name) REFERENCES hdb_catalog.hdb_table(table_schema, table_name) ON UPDATE CASCADE;
+
+
+--
+-- Name: hdb_remote_relationship hdb_remote_relationship_table_schema_table_name_fkey; Type: FK CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_remote_relationship
+    ADD CONSTRAINT hdb_remote_relationship_table_schema_table_name_fkey FOREIGN KEY (table_schema, table_name) REFERENCES hdb_catalog.hdb_table(table_schema, table_name) ON UPDATE CASCADE;
+
+
+--
+-- Name: hdb_scheduled_event_invocation_logs hdb_scheduled_event_invocation_logs_event_id_fkey; Type: FK CONSTRAINT; Schema: hdb_catalog; Owner: postgres
+--
+
+ALTER TABLE ONLY hdb_catalog.hdb_scheduled_event_invocation_logs
+    ADD CONSTRAINT hdb_scheduled_event_invocation_logs_event_id_fkey FOREIGN KEY (event_id) REFERENCES hdb_catalog.hdb_scheduled_events(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: signal Signal_algo_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.signal
+    ADD CONSTRAINT "Signal_algo_id_fkey" FOREIGN KEY (algo_id) REFERENCES public.algo(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: history_signal history_signal_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.history_signal
+    ADD CONSTRAINT history_signal_id_fkey FOREIGN KEY (id) REFERENCES public.signal(id) ON UPDATE RESTRICT ON DELETE RESTRICT;
+
+
+--
+-- Name: signal signal_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.signal
+    ADD CONSTRAINT signal_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.asset(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- PostgreSQL database dump complete
+--
+
