@@ -1,19 +1,28 @@
 import Reac , { Component } from 'react' ;
-import { Table ,Button  } from "reactstrap";
-import '../assets/styles/FormAdmin.css' ;
+import { Table , Button  } from "reactstrap";
+import 'bootstrap/dist/css/bootstrap.min.css';
 
 class ListItem extends Component {
 
     onchangeActive( text) {
         this.props.onchangeActive( text) ;
-
     }
     onclickRole(text) {
         this.props.onchangeRole( text) ;
     }
+    // delete
+    onchangeDelete(value){
+        this.props.DeleteIndex(value) ;
+        this.props.onchangeDelete();
+    }
+    //edit
+    onchangeEdit(value){
+        this.props.onchangeEdit(value);
+        this.props.EditIndex(value) ;
+    }
 
     render(){
-        const { todoList , showConfirmDelete , showConfirmEdit } = this.props ;
+        const { todoList , onchangeDelete , onchangeEdit } = this.props ;
         let element = todoList.map( (item ,index) => {
             let colorActive = 'danger' ;
             let colorRole = 'danger' ;
@@ -36,27 +45,28 @@ class ListItem extends Component {
                                     {item.Role}
                                 </Button>
                             </td>
-                            <th>    
-                            </th>
+                            <td>  
+                                {item.STATUS}
+                            </td>
                             <th>
-                                <i  className ="fa fa-pencil-square-o fa-lg edit" 
+                                <i  className ="fa fa-pencil-square-o fa-lg edit"   
                                     aria-hidden="true"
-                                    onClick = { showConfirmEdit }
+                                    onClick = { () => this.onchangeEdit(item) }
                                 >
                                 </i>
                                 <i  className ="fa fa-trash-o fa-lg delete" 
                                     aria-hidden="true"
-                                    onClick = { () => showConfirmDelete(item) }
-                                
+                                    onClick = { () => this.onchangeDelete(item) }
                                 >
                                 </i>
                             </th>   
                         </tr>
             ) ;
         });
-        return (    <>
-                        {element}
-                    </>
+        return (  
+            <>
+                {element}
+            </>
         );
     }
 }
